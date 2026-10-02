@@ -4394,13 +4394,17 @@ class SliceView(View):
         Normalize start and end such that both are in the range
         [0, x.get_size()[dim]] and start <= end.
         """
+        import torch.fx.experimental._config as exp_config
+
         sizevars = V.graph.sizevars
         dim_size = x.get_size()[dim]
 
         if any(free_unbacked_symbols(x) for x in (start, end, dim_size)):
             min_func = Min
             max_func = Max
-        elif any(
+        # Without hints, evaluate_min can't decide e.g. min(sys.maxsize, s0)
+        # from an open-ended slice like x[1:].
+        elif exp_config.backed_size_oblivious or any(
             # Only needed when backed_size_oblivious is on.
             x.has(sympy.Min, sympy.Max, Min, Max)
             for x in (start, end, dim_size)
