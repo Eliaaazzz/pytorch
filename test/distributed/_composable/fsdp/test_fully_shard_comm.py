@@ -26,7 +26,7 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     OffloadPolicy,
 )
-from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather
+from torch.distributed.fsdp._fully_shard._fsdp_api import AllGather, AllGatherInput
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     _div_if_needed,
     _get_gradient_divide_factors,
@@ -41,13 +41,16 @@ from torch.distributed.fsdp._fully_shard._fsdp_init import (
     _get_post_forward_mesh_info,
     _init_default_fully_shard_mesh,
 )
-from torch.distributed.fsdp._fully_shard._fsdp_param import ShardedState
+from torch.distributed.fsdp._fully_shard._fsdp_param import (
+    _normalize_all_gather_inputs,
+    ShardedState,
+)
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import (
     AllGatherState,
     FSDPCommContext,
     FSDPParamGroup,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.debug import CommDebugMode
 from torch.distributed.tensor.experimental import implicit_replication
 from torch.profiler import profile, ProfilerActivity
@@ -240,6 +243,17 @@ class TestFullyShardCollectiveOps(FSDPTestMultiThread):
                 all_gather_copy_in_stream=all_gather_copy_in_stream,
                 all_gather_stream=all_gather_stream,
             )
+
+    @skip_if_lt_x_gpu(1)
+    def test_all_gather_empty_params(self):
+        stream = device_module.current_stream()
+        self._test_all_gather(
+            [torch.Size([0, 4]), torch.Size([0])],
+            reshard_after_forward=True,
+            async_op=False,
+            all_gather_copy_in_stream=stream,
+            all_gather_stream=stream,
+        )
 
     def _test_all_gather(
         self,
@@ -457,6 +471,101 @@ class TestFullyShardChunkCatMixedDtype(TestCase):
 
 instantiate_device_type_tests(
     TestFullyShardChunkCatMixedDtype, globals(), only_for=("cpu", "cuda", "xpu")
+)
+
+
+class TestFullyShardAllGatherInputValidation(TestCase):
+    def test_invalid_all_gather_inputs(self):
+        # Checked before the collective, also against outputs cached by an
+        # earlier call
+        shard = torch.empty(2, 3)
+        kwargs = {"world_size": 2, "shard_dim": 1, "padded_sharded_size": shard.size()}
+        cached = [torch.empty(12)]
+        for inputs, outputs, error, match in (
+            ((AllGatherInput(shard, dim=2),), (), ValueError, "dim 2 is invalid"),
+            (
+                (AllGatherInput(shard, output_size=torch.Size((2, 5))),),
+                (),
+                ValueError,
+                "must contain 12 elements",
+            ),
+            ((AllGatherInput("shard"),), (), TypeError, "Expected an all-gather input"),
+            ((torch.empty(4, 3),), (), ValueError, r"Shard\(1\) .* must have 12"),
+            ((shard, shard), cached, ValueError, "returned 2 all-gather inputs"),
+            ((shard.to(torch.bfloat16),), cached, ValueError, "changed dtype"),
+            ((torch.empty(4, 3),), cached, ValueError, "needs 96 bytes"),
+            ((AllGatherInput(shard[0]),), cached, ValueError, "element count"),
+        ):
+            with self.assertRaisesRegex(error, match):
+                _normalize_all_gather_inputs(
+                    inputs, all_gather_outputs=outputs, **kwargs
+                )
+
+
+class TestFullyShardCustomAllocation(FSDPTestMultiThread):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @parametrize("shard_dim", [0, 1])
+    @parametrize("collective", ["all_gather", "reduce_scatter"])
+    def test_strided_allocation(self, device, shard_dim, collective):
+        test_case = self
+        model = nn.Linear(8, 4, bias=False, device=device)
+        dist.broadcast(model.weight.detach(), src=0)
+        reference = copy.deepcopy(model)
+        shard_numel = model.weight.numel() // self.world_size
+
+        class StridedAlloc:
+            def allocate(self, size, *, dtype, device):
+                # FSDP views the reduced gradient with contiguous strides.
+                if collective == "reduce_scatter" and size == (shard_numel,):
+                    return torch.empty(size, dtype=dtype, device=device)
+                buffer = torch.empty((*size, 2), dtype=dtype, device=device)[..., 0]
+                test_case.assertFalse(buffer.is_contiguous())
+                return buffer
+
+        class StridedAllGather(StridedAlloc, DefaultAllGather):
+            def __call__(self, output_tensor, input_tensor, group, async_op=False):
+                output = torch.empty_like(output_tensor)
+                super().__call__(output, input_tensor.contiguous(), group)
+                output_tensor.copy_(output)
+
+        class StridedReduceScatter(StridedAlloc, DefaultReduceScatter):
+            def __call__(self, output_tensor, input_tensor, group, op, async_op=False):
+                output = torch.empty_like(output_tensor)
+                super().__call__(output, input_tensor.contiguous(), group, op)
+                output_tensor.copy_(output)
+
+        fully_shard(
+            model,
+            mesh=init_device_mesh(torch.device(device).type, (self.world_size,)),
+            shard_placement_fn=lambda param: Shard(shard_dim),
+        )
+        if collective == "all_gather":
+            model.set_custom_all_gather(StridedAllGather())
+        else:
+            model.set_custom_reduce_scatter(StridedReduceScatter())
+        optim = torch.optim.SGD(model.parameters(), lr=0.1)
+        reference_optim = torch.optim.SGD(reference.parameters(), lr=0.1)
+        for iteration in range(2):
+            inp = torch.full((2, 8), float(self.rank + iteration + 1), device=device)
+            expected = reference(inp)
+            actual = model(inp)
+            self.assertEqual(actual, expected)
+            expected.sum().backward()
+            actual.sum().backward()
+            dist.all_reduce(reference.weight.grad)
+            reference.weight.grad.div_(self.world_size)
+            self.assertEqual(model.weight.grad.full_tensor(), reference.weight.grad)
+            optim.step()
+            reference_optim.step()
+            optim.zero_grad()
+            reference_optim.zero_grad()
+
+
+instantiate_device_type_tests(
+    TestFullyShardCustomAllocation, globals(), only_for=("cpu", "cuda")
 )
 
 
