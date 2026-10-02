@@ -896,7 +896,7 @@ class TestFullyShardAllGatherExtensionsMultiThread(
         )
         inp = torch.arange(48, device=device_type).float().view_as(expected) / 32
         for iteration in range(2):
-            byte_inputs = iteration == 1 and shard_world_size > 1
+            byte_inputs = iteration == 1
             output = model(inp)
             ref_output = ref_model(inp)
             self.assertEqual(output, ref_output, atol=0, rtol=0)
